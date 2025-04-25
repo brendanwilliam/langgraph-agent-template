@@ -28,4 +28,4 @@ workflow.add_conditional_edges("agent", should_continue, ["tools", END])
 workflow.add_edge("tools", "process_results")
 workflow.add_edge("process_results", "agent")
 
-chatbot = workflow.compile()
+my_agent = workflow.compile()
