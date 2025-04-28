@@ -1,26 +1,39 @@
 import os
-from tavily import TavilyClient
-from langchain_core.tools import tool
-from bs4 import BeautifulSoup
-from markdownify import markdownify as md
+from typing import Dict, Any, List, Tuple, Optional, Union, Callable
+from pydantic import BaseModel, Field
+from langchain_core.tools import tool, BaseTool, ToolException
+from langchain_core.messages import ToolMessage, AIMessage, HumanMessage
+from langchain_core.callbacks import CallbackManagerForToolRun
+from langgraph.prebuilt import ToolNode
+from langgraph.graph import StateGraph
 from dotenv import load_dotenv
 import requests
+import json
+
+# For Tavily integration
+from tavily import TavilyClient
+from bs4 import BeautifulSoup
+from markdownify import markdownify as md
 import re
 
 # Load environment variables
 load_dotenv()
 
-@tool(response_format="content_and_artifact")
-def tavily_search_and_extract(query: str, max_results: int = 3):
+# =====================================================================
+# TOOL DEFINITIONS
+# =====================================================================
+
+@tool
+def tavily_search_and_extract(query: str, max_results: int = 3) -> str:
     """
-    Get Tavily query for user input.
+    Search for information and extract content from relevant web pages.
 
     Args:
-        query: The query string.
+        query: The search query string.
         max_results: The maximum number of results to return.
 
     Returns:
-        search, serialized_extract
+        A summary of search results and extracted content.
     """
     try:
         # Get search results from Tavily
@@ -31,115 +44,185 @@ def tavily_search_and_extract(query: str, max_results: int = 3):
             include_answer="basic"
         )
 
-        # Get extracted information from Tavily
-        urls = [result['url'] for result in search['results']]
-        extract = tavily_client.extract(urls=urls)
-        # Serialize the extracted results
-        serialized_extract = "\n\n".join(
-            f"Source: {doc['url']}\nContent: {doc['raw_content']}"
-            for doc in extract['results']
-        )
-
-        # Create a tool message that summarizes the search
-        tool_message = f"Searched for '{query}' and found {len(urls)} relevant results."
-
-        return tool_message, serialized_extract
+        return search
 
     except Exception as e:
         # Handle errors gracefully
-        error_message = f"Error during search: {str(e)}"
-        return error_message, f"Failed to retrieve information about '{query}'. Error: {str(e)}"
+        return f"Error during search: {str(e)}\nFailed to retrieve information about '{query}'."
 
+# =====================================================================
+# CUSTOM TOOL CLASSES
+# =====================================================================
 
-@tool(response_format="content_and_artifact")
-def google_search_and_extract(query: str, num_results: int = 1):
+# Example of a custom tool using Pydantic for schema definition
+class WeatherInput(BaseModel):
+    """Input for the weather tool."""
+    location: str = Field(description="The city and state, e.g. San Francisco, CA")
+    unit: str = Field(default="fahrenheit", description="The temperature unit to use. Celsius or Fahrenheit")
+
+class WeatherTool(BaseTool):
+    """Tool that gets the current weather in a given location"""
+    name: str = "get_weather"
+    description: str = "Get the current weather in a location"
+    args_schema: type = WeatherInput
+
+    def _run(self, location: str, unit: str = "fahrenheit", run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
+        """Use the tool."""
+        # This is a placeholder implementation
+        # In a real implementation, you would call a weather API here
+        return f"The current weather in {location} is 72°{unit[0].upper()}"
+
+# =====================================================================
+# TOOL REGISTRATION AND CONFIGURATION
+# =====================================================================
+
+# Define all available tools
+AVAILABLE_TOOLS = [
+    tavily_search_and_extract,
+    WeatherTool(),
+    # Add more tools here
+]
+
+# Create a ToolNode for LangGraph integration
+tool_node = ToolNode(tools=AVAILABLE_TOOLS)
+
+# =====================================================================
+# STATE MANAGEMENT HELPERS
+# =====================================================================
+
+def process_tool_results(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Perform a custom Google Search for the given query and extract the results into Markdown format.
+    Process the results of tool execution and update the state.
+
+    This function is used as a node in the LangGraph to process tool outputs
+    and format them as messages that can be added to the conversation history.
 
     Args:
-        query: The search query
-        num_results: The number of results to return
+        state: The current state of the conversation
 
     Returns:
-        search, serialized_extract
+        Updated state with tool results added as messages
     """
+    # Get the last tool call and its result
+    messages = state.get("messages", [])
+    last_message = messages[-1] if messages else None
 
-    # Function to fetch content from a URL
-    def extract(url: str) -> str:
-        """
-        Fetch the content of a webpage and convert it into Markdown.
+    # If there's no last message or it's not a tool result, return unchanged state
+    if not last_message or not hasattr(last_message, "tool_call_id"):
+        return state
 
-        Args:
-            url: The URL to fetch
+    # Create a new ToolMessage from the result
+    tool_message = ToolMessage(
+        content=last_message.content,
+        tool_call_id=last_message.tool_call_id,
+        name=last_message.name
+    )
 
-        Returns:
-            str: The content of the webpage in Markdown format with source attribution
-        """
-        try:
-            response = requests.get(url, timeout=10)
-            if response.status_code != 200:
-                print(f"Error: {response.status_code}")
-                print(response.text)
-                return []
+    # Return updated state with the new message
+    return {"messages": [tool_message]}
 
-            soup = BeautifulSoup(response.text, 'html.parser')
+# =====================================================================
+# TOOL ROUTING FUNCTIONS
+# =====================================================================
 
-            # Remove script and style elements
-            for script in soup(["script", "style", "nav", "header", "footer", "aside"]):
-                script.extract()
+def should_use_tool(state: Dict[str, Any]) -> str:
+    """
+    Determine if we should route to a tool based on the current state.
 
-            # Convert to markdown
-            markdown = md(
-                str(soup),
-                heading_style="ATX",
-                convert=["a", "p", "h1", "h2", "h3", "h4", "h5", "h6", "strong", "em", "ul", "ol", "li", "table"],
-                escape_asterisks=False,
-                escape_underscores=False
+    This function examines the last AI message to check if it contains
+    tool calls. If it does, route to the tools node, otherwise end the graph.
+
+    Args:
+        state: The current state of the conversation
+
+    Returns:
+        Next node to route to ("tools" or END)
+    """
+    messages = state.get("messages", [])
+    if not messages:
+        return "END"
+
+    last_message = messages[-1]
+
+    # Check if the last message is from the AI and has tool calls
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        return "tools"
+
+    # No tool calls, end the graph
+    return "END"
+
+# =====================================================================
+# ADVANCED TOOL INTEGRATION PATTERNS
+# =====================================================================
+
+# Example of a Command object for updating state from tools
+class Command(BaseModel):
+    """Command object for updating state from tools."""
+    name: str
+    args: Dict[str, Any] = Field(default_factory=dict)
+
+# Example of a custom tool that returns a Command object
+class UpdateStateWeatherTool(BaseTool):
+    """Tool that gets weather and updates state with a command object."""
+    name: str = "update_state_weather"
+    description: str = "Get weather and update state with the information"
+    args_schema: type = WeatherInput
+
+    def _run(
+        self,
+        location: str,
+        unit: str = "fahrenheit",
+        run_manager: Optional[CallbackManagerForToolRun] = None
+    ) -> Dict[str, Any]:
+        """Use the tool and return a Command to update state."""
+        # Get weather (placeholder implementation)
+        weather_info = f"The current weather in {location} is 72°{unit[0].upper()}"
+
+        # Return a Command object that will be processed to update state
+        return {
+            "content": weather_info,
+            "command": Command(
+                name="update_weather_state",
+                args={
+                    "location": location,
+                    "weather": weather_info,
+                    "timestamp": "2023-04-28T12:00:00Z"  # Example timestamp
+                }
             )
-            markdown = f"Source: {url}\n\nContent: {markdown}\n\n"
-            markdown = re.sub(r'\n{3,}', '\n\n', markdown)
-
-            return markdown[:10000]
-
-        except Exception as e:
-            print(f"Error: {e}")
-            return ""
-
-    try:
-        base_url = "https://www.googleapis.com/customsearch/v1"
-        params = {
-            'key': os.getenv("GOOGLE_SEARCH_API_KEY"),
-            'cx': os.getenv("GOOGLE_SEARCH_ENGINE_ID"),
-            'q': query,
-            'num': min(num_results, 5)  # API limit is 10 per request
         }
 
-        response = requests.get(base_url, params=params)
+# Function to process Command objects from tools
+def process_commands(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Process Command objects from tool results and update state accordingly.
 
-        if response.status_code != 200:
-            print(f"Error: {response.status_code}")
-            print(response.text)
-            return [], ""
+    Args:
+        state: The current state
 
-        results = response.json()['items']
-        urls = [item['link'] for item in results]
+    Returns:
+        Updated state
+    """
+    messages = state.get("messages", [])
+    if not messages:
+        return state
 
-        # Create markdown links with titles
-        markdown_links = []
-        for item in results:
-            title = item.get('title', 'No Title')
-            url = item.get('link', '')
-            markdown_links.append(f"[{title}]({url})")
+    last_message = messages[-1]
 
-        extract = "\n\n".join(
-            f"Source: {url}\nContent: {extract(url)}"
-            for url in urls
-        )
+    # Check if the last message has a command
+    if hasattr(last_message, "additional_kwargs") and "command" in last_message.additional_kwargs:
+        command = last_message.additional_kwargs["command"]
 
-        # Create a tool message that summarizes the search
-        tool_message = f"Searched for '{query}' and found {len(urls)} relevant sources:\n\n" + "\n".join(markdown_links)
-        return tool_message, extract
+        # Process different command types
+        if command.name == "update_weather_state":
+            # Update weather information in state
+            weather_state = state.get("weather_data", {})
+            weather_state[command.args["location"]] = {
+                "info": command.args["weather"],
+                "timestamp": command.args["timestamp"]
+            }
 
-    except Exception as e:
-        print(f"Error: {e}")
-        return "", ""
+            # Return updated state
+            return {**state, "weather_data": weather_state}
+
+    # If no command or unrecognized command, return state unchanged
+    return state

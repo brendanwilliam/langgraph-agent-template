@@ -3,7 +3,9 @@
         "."
     ],
     "graphs": {
-        "my_agent": "./agent/graph.py:my_agent"
+        "my_agent": "./agent/graph.py:my_agent",
+        "my_analytics": "./agent/graph.py:my_analytics",
+        "my_command": "./agent/graph.py:my_command"
     },
     "env": "./.env"
 }
